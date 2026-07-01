@@ -118,10 +118,27 @@ class WebConvexClient implements IConvexClient {
   }
 
   /// Establishes WebSocket connection to Convex backend.
+  ///
+  /// Waits for the socket to reach a definitive outcome (open, error, or
+  /// close) before returning, so callers that `await` this (directly, or
+  /// transitively via `ConvexClient.initialize()`) can rely on the
+  /// connection being either usable or definitively not once the Future
+  /// resolves. Without this, `initialize()` used to resolve as soon as the
+  /// `WebSocket` object was merely *constructed* — before the handshake
+  /// completed — so an immediate `subscribe()`/`query()`/`mutation()` call
+  /// could race `_sendMessage`'s `readyState` check and throw
+  /// `StateError('WebSocket not connected')`, silently aborting whatever
+  /// unawaited setup triggered it (e.g. `RealtimeRingSource._startAsync()`).
+  /// Bounded by a timeout so a network that never responds doesn't hang
+  /// `initialize()` forever. Reconnect attempts (via `_scheduleReconnect`)
+  /// also call `_connect()` but nothing awaits those, so they still fire
+  /// independently of this Future.
   Future<void> _connect() async {
     if (_isDisposed) return;
 
     debugPrint('=== [WebConvexClient] Connecting to Convex ===');
+
+    final firstOutcome = Completer<void>();
 
     try {
       // Convert HTTPS to WSS URL with correct Convex sync endpoint
@@ -138,19 +155,41 @@ class WebConvexClient implements IConvexClient {
       _ws = web.WebSocket(fullUrl);
 
       // Setup event listeners
-      _setupWebSocketListeners();
+      _setupWebSocketListeners(onFirstOutcome: () {
+        if (!firstOutcome.isCompleted) firstOutcome.complete();
+      });
 
       debugPrint('=== [WebConvexClient] WebSocket connection initiated ===');
     } catch (e) {
       debugPrint('ERROR: [WebConvexClient] Connection failed: $e');
       _scheduleReconnect();
+      return;
     }
+
+    await firstOutcome.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        debugPrint('ERROR: [WebConvexClient] Initial connect timed out waiting for open/close/error');
+      },
+    );
   }
 
   /// Sets up WebSocket event listeners.
-  void _setupWebSocketListeners() {
+  ///
+  /// [onFirstOutcome], if given, fires exactly once — on whichever of
+  /// open/close/error happens first for this socket — so `_connect()` can
+  /// resolve its Future only once the connection attempt has a definitive
+  /// result instead of as soon as the socket object exists.
+  void _setupWebSocketListeners({void Function()? onFirstOutcome}) {
     final ws = _ws;
     if (ws == null) return;
+
+    var outcomeNotified = false;
+    void notifyFirstOutcome() {
+      if (outcomeNotified) return;
+      outcomeNotified = true;
+      onFirstOutcome?.call();
+    }
 
     // Connection opened
     ws.onopen = (web.Event event) {
@@ -166,6 +205,8 @@ class WebConvexClient implements IConvexClient {
       if (_currentAuthToken != null) {
         _sendAuthMessage(_currentAuthToken!);
       }
+
+      notifyFirstOutcome();
     }.toJS;
 
     // Connection closed
@@ -181,6 +222,8 @@ class WebConvexClient implements IConvexClient {
       if (!_isDisposed) {
         _scheduleReconnect();
       }
+
+      notifyFirstOutcome();
     }.toJS;
 
     // Connection error
@@ -188,6 +231,8 @@ class WebConvexClient implements IConvexClient {
       debugPrint('ERROR: [WebConvexClient] WebSocket error occurred');
       debugPrint('ERROR: [WebConvexClient] Event type: ${event.type}');
       _updateConnectionState(WebSocketConnectionState.connecting);
+
+      notifyFirstOutcome();
     }.toJS;
 
     // Message received
